@@ -1286,3 +1286,301 @@ def test_lineage_dangling_edge_returns_409(client):
     r = get_lineage(client, 1)
     assert r.status_code == 409
     assert r.json()["detail"]["code"] == "LINEAGE_CORRUPT"
+
+
+# ---------- 结算期费率锁定 ----------
+
+def post_lock(client, contract, **kw):
+    return client.post(f"/contracts/{contract}/rate-locks", json=kw)
+
+
+def test_rate_lock_single_segment_and_list(client):
+    """窗口被单一版本完整覆盖 → 单片段锁定；合同锁记录可查询。"""
+    post_rate(client, contract_no="K-1", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="初始费率")
+    r = post_lock(client, "K-1",
+                  **{"from": "2026-02-01T00:00:00Z", "to": "2026-10-01T00:00:00Z"},
+                  known_at="2026-02-01T00:00:00Z", reason="结算锁定")
+    assert r.status_code == 201, r.text
+    lock = r.json()
+    assert lock["contract_no"] == "K-1"
+    assert lock["from"] == "2026-02-01T00:00:00.000000+00:00"
+    assert lock["to"] == "2026-10-01T00:00:00.000000+00:00"
+    assert lock["known_at"] == "2026-02-01T00:00:00.000000+00:00"
+    assert lock["reason"] == "结算锁定"
+    assert lock["lock_id"] == 1
+    assert lock["created_at"]
+    (seg,) = lock["segments"]
+    assert seg["from"] == "2026-02-01T00:00:00.000000+00:00"
+    assert seg["to"] == "2026-10-01T00:00:00.000000+00:00"
+    assert seg["rate_id"] == 1
+    assert seg["rate"] == 0.05
+
+    lst = client.get("/contracts/K-1/rate-locks")
+    assert lst.status_code == 200
+    locks = lst.json()["locks"]
+    assert len(locks) == 1
+    assert locks[0]["lock_id"] == lock["lock_id"]
+    assert [s["segment_id"] for s in locks[0]["segments"]] == [seg["segment_id"]]
+
+
+def test_rate_lock_splits_into_continuous_segments(client):
+    """锁定窗口跨两个相接版本：按覆盖切分规则保存为连续片段，各带 basis rate_id。"""
+    post_rate(client, contract_no="K-2", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="K-2", rate=0.06,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = post_lock(client, "K-2",
+                  **{"from": "2026-03-01T00:00:00Z", "to": "2026-09-01T00:00:00Z"},
+                  known_at="2026-02-01T00:00:00Z")
+    assert r.status_code == 201, r.text
+    segs = r.json()["segments"]
+    assert [(s["from"], s["to"], s["rate_id"], s["rate"]) for s in segs] == [
+        ("2026-03-01T00:00:00.000000+00:00", "2026-06-01T00:00:00.000000+00:00", 1, 0.05),
+        ("2026-06-01T00:00:00.000000+00:00", "2026-09-01T00:00:00.000000+00:00", 2, 0.06),
+    ]
+
+
+def test_rate_lock_gap_rejected_and_nothing_persisted(client):
+    """窗口内存在 gap → 409 RATE_LOCK_UNSAFE，列出非 covered 片段，不落任何锁记录。"""
+    post_rate(client, contract_no="K-3", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = post_lock(client, "K-3",
+                  **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
+                  known_at="2026-02-01T00:00:00Z", reason="全年锁定")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "RATE_LOCK_UNSAFE"
+    assert detail["known_at"] == "2026-02-01T00:00:00.000000+00:00"
+    assert [(s["from"], s["to"], s["status"]) for s in detail["unsafe_segments"]] == [
+        ("2026-07-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00", "gap"),
+    ]
+    assert client.get("/contracts/K-3/rate-locks").json()["locks"] == []
+
+
+def test_rate_lock_conflict_rejected_409(client):
+    """窗口内存在重叠冲突（脏数据）→ 409 RATE_LOCK_UNSAFE，附全部候选，不落库。"""
+    post_rate(client, contract_no="K-4", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version) "
+            "VALUES ('K-4', 0.99, '2026-06-01T00:00:00.000000+00:00', "
+            "        '2026-09-01T00:00:00.000000+00:00', "
+            "        '2026-01-01T00:00:00.000000+00:00', 2)"
+        )
+    r = post_lock(client, "K-4",
+                  **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
+                  known_at="2026-02-01T00:00:00Z")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "RATE_LOCK_UNSAFE"
+    (unsafe,) = detail["unsafe_segments"]
+    assert unsafe["status"] == "conflict"
+    assert unsafe["from"] == "2026-06-01T00:00:00.000000+00:00"
+    assert unsafe["to"] == "2026-09-01T00:00:00.000000+00:00"
+    assert [(c["rate_id"], c["rate"]) for c in unsafe["candidates"]] == [(1, 0.05), (2, 0.99)]
+    assert client.get("/contracts/K-4/rate-locks").json()["locks"] == []
+
+
+def test_rate_lock_unknown_contract_is_unsafe(client):
+    """合同不存在 → 整窗 gap → 409 RATE_LOCK_UNSAFE（不报 404）。"""
+    r = post_lock(client, "GHOST",
+                  **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
+                  known_at="2026-06-01T00:00:00Z")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "RATE_LOCK_UNSAFE"
+    (unsafe,) = detail["unsafe_segments"]
+    assert unsafe["status"] == "gap"
+    assert unsafe["from"] == "2026-01-01T00:00:00.000000+00:00"
+    assert unsafe["to"] == "2027-01-01T00:00:00.000000+00:00"
+
+
+def test_rate_lock_invalid_interval_422(client):
+    for frm, to in [("2026-09-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                    ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")]:
+        r = post_lock(client, "K-X", **{"from": frm, "to": to})
+        assert r.status_code == 422
+        assert r.json()["detail"]["code"] == "INVALID_INTERVAL"
+
+
+def test_rate_lock_future_known_at_422(client):
+    r = post_lock(client, "K-X",
+                  **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
+                  known_at="2999-01-01T00:00:00Z")
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_KNOWN_AT"
+
+
+def test_rate_lock_malformed_request_422(client):
+    # 缺少必填的 from/to / 时间格式非法 → 统一的 INVALID_REQUEST
+    r = client.post("/contracts/K-X/rate-locks", json={"to": "2027-01-01T00:00:00Z"})
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+    r = post_lock(client, "K-X", **{"from": "not-a-date", "to": "2027-01-01T00:00:00Z"})
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+
+
+def test_rate_lock_default_known_at_is_now(client):
+    # known_at 缺省 = 当前时间；当前可见版本即可锁定
+    post_rate(client, contract_no="K-5", rate=0.05, valid_from="2020-01-01T00:00:00Z")
+    r = post_lock(client, "K-5",
+                  **{"from": "2026-01-01T00:00:00Z", "to": "2026-07-01T00:00:00Z"})
+    assert r.status_code == 201, r.text
+    (seg,) = r.json()["segments"]
+    assert seg["rate_id"] == 1
+    assert seg["rate"] == 0.05
+
+
+def test_rate_lock_basis_follows_known_at(client):
+    """锁定依据取 known_at 时点可见的版本：修订前后锁定到不同的 basis。"""
+    post_rate(client, contract_no="K-6", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="K-6", rate=0.08,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z")
+    # 修订前认知时点：全年仅 v1 可见 → 单片段锁定，basis 为 v1
+    r = post_lock(client, "K-6",
+                  **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
+                  known_at="2026-02-01T00:00:00Z", reason="按 2 月认知锁定")
+    assert r.status_code == 201, r.text
+    (seg,) = r.json()["segments"]
+    assert (seg["rate_id"], seg["rate"]) == (1, 0.05)
+    # 修订后认知时点：上半年为补偿版本 v3、下半年为新版本 v2
+    r2 = post_lock(client, "K-6",
+                   **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
+                   known_at="2026-03-02T00:00:00Z")
+    assert r2.status_code == 201, r2.text
+    assert [(s["rate_id"], s["rate"]) for s in r2.json()["segments"]] == [(3, 0.05), (2, 0.08)]
+
+
+def test_create_rate_blocked_by_lock_returns_409_and_writes_nothing(client):
+    """拟议区间与锁定片段相交 → 409 RATE_WINDOW_LOCKED（附锁与交集），
+    不新增版本、不产生补偿片段、不写血缘边。"""
+    post_rate(client, contract_no="K-7", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="原费率")
+    post_lock(client, "K-7",
+              **{"from": "2026-03-01T00:00:00Z", "to": "2026-09-01T00:00:00Z"},
+              known_at="2026-02-01T00:00:00Z", reason="结算锁定")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        versions_before = conn.execute("SELECT COUNT(*) FROM rate_versions").fetchone()[0]
+        edges_before = conn.execute("SELECT COUNT(*) FROM rate_version_edges").fetchone()[0]
+
+    r = post_rate(client, contract_no="K-7", rate=0.09,
+                  valid_from="2026-06-01T00:00:00Z", valid_to="2026-12-01T00:00:00Z",
+                  recorded_at="2026-04-01T00:00:00Z", reason="试图修订")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "RATE_WINDOW_LOCKED"
+    (conflict,) = detail["locks"]
+    assert conflict["lock_id"] == 1
+    assert conflict["rate_id"] == 1
+    assert conflict["locked_from"] == "2026-03-01T00:00:00.000000+00:00"
+    assert conflict["locked_to"] == "2026-09-01T00:00:00.000000+00:00"
+    assert conflict["intersection"] == {
+        "from": "2026-06-01T00:00:00.000000+00:00",
+        "to": "2026-09-01T00:00:00.000000+00:00",
+    }
+
+    # 不落任何数据：版本数、血缘边数均不变，旧版本仍是 current
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM rate_versions").fetchone()[0] == versions_before
+        assert conn.execute("SELECT COUNT(*) FROM rate_version_edges").fetchone()[0] == edges_before
+    versions = client.get("/contracts/K-7/timeline").json()["versions"]
+    assert [v["version"] for v in versions] == [1]
+    assert versions[0]["status"] == "current"
+
+
+def test_create_rate_blocked_lists_all_intersecting_lock_segments(client):
+    """拟议区间横跨同一锁的多个片段 → 409 逐一列出锁与交集。"""
+    post_rate(client, contract_no="K-8", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="K-8", rate=0.06,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_lock(client, "K-8",
+              **{"from": "2026-03-01T00:00:00Z", "to": "2026-09-01T00:00:00Z"},
+              known_at="2026-02-01T00:00:00Z")
+    r = post_rate(client, contract_no="K-8", rate=0.09,
+                  valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+                  recorded_at="2026-04-01T00:00:00Z")
+    assert r.status_code == 409
+    locks = r.json()["detail"]["locks"]
+    assert [(c["locked_from"], c["locked_to"], c["rate_id"]) for c in locks] == [
+        ("2026-03-01T00:00:00.000000+00:00", "2026-06-01T00:00:00.000000+00:00", 1),
+        ("2026-06-01T00:00:00.000000+00:00", "2026-09-01T00:00:00.000000+00:00", 2),
+    ]
+    assert [c["intersection"] for c in locks] == [
+        {"from": "2026-03-01T00:00:00.000000+00:00", "to": "2026-06-01T00:00:00.000000+00:00"},
+        {"from": "2026-06-01T00:00:00.000000+00:00", "to": "2026-09-01T00:00:00.000000+00:00"},
+    ]
+
+
+def test_create_rate_open_ended_blocked_by_lock(client):
+    """开放上界的拟议区间与锁定片段相交同样被拒绝。"""
+    post_rate(client, contract_no="K-9", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_lock(client, "K-9",
+              **{"from": "2026-06-01T00:00:00Z", "to": "2026-09-01T00:00:00Z"},
+              known_at="2026-02-01T00:00:00Z")
+    r = post_rate(client, contract_no="K-9", rate=0.09,
+                  valid_from="2026-08-01T00:00:00Z",
+                  recorded_at="2026-04-01T00:00:00Z")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "RATE_WINDOW_LOCKED"
+    (conflict,) = detail["locks"]
+    assert conflict["intersection"] == {
+        "from": "2026-08-01T00:00:00.000000+00:00",
+        "to": "2026-09-01T00:00:00.000000+00:00",
+    }
+
+
+def test_create_rate_adjacent_to_lock_allowed(client):
+    """左闭右开：与锁定片段仅端点相触不算相交，可正常录入。"""
+    post_rate(client, contract_no="K-10", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_lock(client, "K-10",
+              **{"from": "2026-01-01T00:00:00Z", "to": "2026-06-01T00:00:00Z"},
+              known_at="2026-02-01T00:00:00Z")
+    r = post_rate(client, contract_no="K-10", rate=0.08,
+                  valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z")
+    assert r.status_code == 201, r.text
+    assert r.json()["created"]["version"] == 2
+
+
+def test_lock_does_not_block_other_contracts(client):
+    """锁只作用于本合同：其他合同相同窗口不受限。"""
+    post_rate(client, contract_no="K-11", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_lock(client, "K-11",
+              **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
+              known_at="2026-02-01T00:00:00Z")
+    r = post_rate(client, contract_no="K-11-OTHER", rate=0.09,
+                  valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+                  recorded_at="2026-01-01T00:00:00Z")
+    assert r.status_code == 201
+
+
+def test_list_locks_empty(client):
+    """无锁记录（含合同不存在）→ 200 空列表，不报 404。"""
+    r = client.get("/contracts/NOPE/rate-locks")
+    assert r.status_code == 200
+    assert r.json() == {"contract_no": "NOPE", "locks": []}

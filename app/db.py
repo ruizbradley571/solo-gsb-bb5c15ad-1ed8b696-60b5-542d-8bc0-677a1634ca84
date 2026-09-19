@@ -34,6 +34,31 @@ CREATE TABLE IF NOT EXISTS rate_version_edges (
     FOREIGN KEY (to_rate_id) REFERENCES rate_versions (id)
 );
 CREATE INDEX IF NOT EXISTS idx_rate_version_edges_from ON rate_version_edges (from_rate_id);
+
+-- 结算期费率锁的锁头：一次锁定请求的窗口、认知时点与原因，只追加、不修改、不删除。
+CREATE TABLE IF NOT EXISTS rate_locks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_no TEXT NOT NULL,          -- 合同号
+    valid_from  TEXT NOT NULL,          -- 锁定窗口起点（含），UTC ISO 字符串
+    valid_to    TEXT NOT NULL,          -- 锁定窗口终点（不含）
+    known_at    TEXT NOT NULL,          -- 锁定判定使用的认知时点
+    reason      TEXT,                   -- 锁定原因
+    created_at  TEXT NOT NULL           -- 锁定落库时间（系统时间）
+);
+CREATE INDEX IF NOT EXISTS idx_rate_locks_contract ON rate_locks (contract_no);
+
+-- 锁定片段：锁窗口按覆盖切分规则得到的连续 covered 片段及其 basis 版本，
+-- 同一锁的片段连续铺满整个锁窗口；与锁头在同一事务写入。
+CREATE TABLE IF NOT EXISTS rate_lock_segments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    lock_id    INTEGER NOT NULL,        -- 所属锁头
+    valid_from TEXT NOT NULL,           -- 片段起点（含）
+    valid_to   TEXT NOT NULL,           -- 片段终点（不含）
+    rate_id    INTEGER NOT NULL,        -- 该片段锁定的依据费率版本
+    FOREIGN KEY (lock_id) REFERENCES rate_locks (id),
+    FOREIGN KEY (rate_id) REFERENCES rate_versions (id)
+);
+CREATE INDEX IF NOT EXISTS idx_rate_lock_segments_lock ON rate_lock_segments (lock_id);
 """
 
 

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi import Body, FastAPI, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -24,8 +24,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.4.0",
-    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录。",
+    version="1.5.0",
+    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期可按认知时点锁定费率窗口，锁定区间内禁止新增/修订。",
     lifespan=lifespan,
 )
 
@@ -198,6 +198,34 @@ class ChargePreviewResponse(BaseModel):
     lines: list[ChargeLineView]
 
 
+class RateLockSegmentView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    segment_id: int
+    from_: str = Field(alias="from", description="片段起点（含）")
+    to: str = Field(description="片段终点（不含）")
+    rate_id: int = Field(description="该片段锁定的依据费率版本 id")
+    rate: float = Field(description="依据版本的费率值")
+
+
+class RateLockView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    lock_id: int
+    contract_no: str
+    from_: str = Field(alias="from", description="锁定窗口起点（含）")
+    to: str = Field(description="锁定窗口终点（不含）")
+    known_at: str = Field(description="锁定判定使用的认知时点")
+    reason: Optional[str]
+    created_at: str = Field(description="锁定落库时间")
+    segments: list[RateLockSegmentView] = Field(description="连续铺满锁定窗口的锁定片段")
+
+
+class RateLockListResponse(BaseModel):
+    contract_no: str
+    locks: list[RateLockView]
+
+
 def to_view(row: sqlite3.Row) -> VersionView:
     return VersionView(
         rate_id=row["id"],
@@ -210,6 +238,19 @@ def to_view(row: sqlite3.Row) -> VersionView:
         superseded_at=row["superseded_at"],
         status="current" if row["superseded_at"] is None else "superseded",
         reason=row["reason"],
+    )
+
+
+def to_lock_view(lock: dict) -> RateLockView:
+    return RateLockView(
+        lock_id=lock["lock_id"],
+        contract_no=lock["contract_no"],
+        from_=lock["from"],
+        to=lock["to"],
+        known_at=lock["known_at"],
+        reason=lock["reason"],
+        created_at=lock["created_at"],
+        segments=[RateLockSegmentView(**seg) for seg in lock["segments"]],
     )
 
 
@@ -233,7 +274,8 @@ def health():
 @app.post("/rates", response_model=RateCreated, status_code=status.HTTP_201_CREATED)
 def create_rate(payload: RateCreate):
     """录入费率。与既有当前版本区间重叠时自动修订：旧版本仅交集被替换，
-    交集之外的左、右部分按原费率与 reason 追加为补偿版本，历史保留、窗口外报价不变。"""
+    交集之外的左、右部分按原费率与 reason 追加为补偿版本，历史保留、窗口外报价不变。
+    拟议区间与任一结算期锁定片段相交时拒绝（409 RATE_WINDOW_LOCKED），不落任何数据。"""
     try:
         row, superseded_ids, retained_rows = logic.record_rate(
             contract_no=payload.contract_no,
@@ -252,6 +294,15 @@ def create_rate(payload: RateCreate):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "NON_MONOTONIC_RECORDED_AT", "message": str(exc)},
+        )
+    except logic.RateWindowLockedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "RATE_WINDOW_LOCKED",
+                "message": str(exc),
+                "locks": exc.conflicts,
+            },
         )
     return RateCreated(
         created=to_view(row),
@@ -451,4 +502,69 @@ def charge_preview(contract_no: str, payload: ChargePreviewRequest):
         status="ok" if result["ok"] else "rejected",
         total_amount=result["total_amount"],
         lines=result["lines"],
+    )
+
+
+@app.post(
+    "/contracts/{contract_no}/rate-locks",
+    response_model=RateLockView,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_rate_lock(
+    contract_no: str,
+    from_: datetime = Body(alias="from", embed=True, description="锁定窗口起点（含），ISO-8601"),
+    to: datetime = Body(embed=True, description="锁定窗口终点（不含），ISO-8601"),
+    known_at: Optional[datetime] = Body(
+        default=None, embed=True, description="认知时点，缺省为当前时间；不得晚于当前时间"
+    ),
+    reason: Optional[str] = Body(default=None, max_length=500, embed=True, description="锁定原因"),
+):
+    """结算期费率锁定：仅当整个窗口 [from, to) 在 known_at 认知时点均为 covered 时，
+    按覆盖切分规则得到的连续片段（含 basis rate_id）在单一事务落库；
+    存在 gap/conflict 片段时返回 409 RATE_LOCK_UNSAFE 且不落库。"""
+    try:
+        lock = logic.create_rate_lock(contract_no, from_, to, known_at, reason)
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    except logic.FutureKnownAtError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_KNOWN_AT", "message": str(exc)},
+        )
+    except logic.RateLockUnsafeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "RATE_LOCK_UNSAFE",
+                "message": str(exc),
+                "known_at": exc.known_at,
+                "unsafe_segments": [
+                    {
+                        "from": seg["from"],
+                        "to": seg["to"],
+                        "status": seg["status"],
+                        "candidates": [
+                            {"rate_id": r["id"], "rate": r["rate"], "version": r["version"]}
+                            for r in seg["candidates"]
+                        ]
+                        if seg["status"] == "conflict"
+                        else [],
+                    }
+                    for seg in exc.unsafe_segments
+                ],
+            },
+        )
+    return to_lock_view(lock)
+
+
+@app.get("/contracts/{contract_no}/rate-locks", response_model=RateLockListResponse)
+def list_rate_locks(contract_no: str):
+    """合同锁记录查询：列出该合同全部费率锁及其连续锁定片段（含 basis rate_id）；
+    无锁记录时返回空列表。"""
+    locks = logic.list_rate_locks(contract_no)
+    return RateLockListResponse(
+        contract_no=contract_no, locks=[to_lock_view(lock) for lock in locks]
     )

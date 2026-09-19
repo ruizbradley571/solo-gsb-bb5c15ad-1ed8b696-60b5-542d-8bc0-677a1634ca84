@@ -59,6 +59,18 @@ docker compose up --build
 各 1 条 `retained_from` 边。**没有任何出边的版本（含功能上线前录入的历史行）
 视为血缘根**，血缘查询对根版本返回单节点、无边。
 
+**结算期费率锁定（v1.5 起）**：结算前可把某个业务窗口 `[from, to)` 在某认知时点
+`known_at` 下的费率“锁死”。锁定时复用覆盖率分析的切分规则把窗口切成连续片段，
+**仅当整个窗口在该认知时点均为 `covered`**（每段都有唯一版本依据）时，才把锁头
+（窗口、`known_at`、原因）与全部锁定片段（含各片段的 basis `rate_id`）在
+**同一事务**落库；任一片段为 `gap` / `conflict` 时整体拒绝
+（`409 RATE_LOCK_UNSAFE`），不落任何记录。
+
+锁一旦生效即不可绕过：`POST /rates` 的拟议区间 `[valid_from, valid_to)` 与该合同
+**任一锁定片段相交**时返回 `409 RATE_WINDOW_LOCKED`（附相交的锁与交集明细），
+且不新增版本、不产生补偿片段、不写血缘边；仅端点相触（左闭右开）不算相交。
+锁记录只追加、不修改、不删除，且只作用于本合同。
+
 ## 接口
 
 ### 1. 录入 / 修订费率 — `POST /rates`
@@ -84,6 +96,8 @@ curl -X POST http://localhost:8000/rates \
   历史 `known_at` 仍可看到未被切分的原版本（见下文“双时态模型”）。
 - 同一合同 `recorded_at` 必须单调递增，否则 `422 NON_MONOTONIC_RECORDED_AT`；
   `valid_to <= valid_from` 返回 `422 INVALID_INTERVAL`。
+- 拟议区间与该合同任一**结算期锁定片段**相交时返回 `409 RATE_WINDOW_LOCKED`
+  （附相交的锁与交集明细），不新增版本、补偿片段或血缘边（见下文“费率锁定”）。
 
 部分重叠修订的响应示例（原费率 0.05 覆盖全年，新费率 0.09 只替换 4–6 月）：
 
@@ -331,6 +345,66 @@ curl http://localhost:8000/rates/2/lineage
 遍历使用带访问标记的迭代式广度优先展开 + Kahn 拓扑校验，即使血缘数据被直接
 篡改成带环也**不会无限递归**，而是返回 `409 LINEAGE_CORRUPT`。
 
+### 8. 结算期费率锁定 — `POST /contracts/{contract_no}/rate-locks`
+
+```bash
+curl -X POST http://localhost:8000/contracts/HT-2026-001/rate-locks \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "from": "2026-04-01T00:00:00Z",
+        "to":   "2026-07-01T00:00:00Z",
+        "known_at": "2026-06-01T00:00:00Z",
+        "reason": "Q2 结算锁定"
+      }'
+```
+
+把窗口 `[from, to)` 在 `known_at` 认知时点的费率锁死，用于结算期内禁止改动费率。
+锁定判定复用覆盖率分析的切分规则：**仅当整个窗口在 `known_at` 时点均为
+`covered`** 时，才把窗口切成的连续片段连同各自的 basis `rate_id` 在**同一事务**
+落库（响应 `201`，`segments[]` 连续铺满整个锁定窗口，每段附 `rate_id` 与 `rate`）。
+`known_at` 缺省为当前时间。
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| 整个窗口均 covered，锁定成功 | 201 | — |
+| 窗口内存在 `gap` / `conflict` 片段 | 409 | `RATE_LOCK_UNSAFE`（附 `unsafe_segments` 明细，**不落库**） |
+| `from >= to` | 422 | `INVALID_INTERVAL` |
+| `known_at` 晚于当前时间 | 422 | `INVALID_KNOWN_AT` |
+| 缺少必填字段 / 时间格式非法 | 422 | `INVALID_REQUEST` |
+
+锁定成功后，`POST /rates` 的拟议区间与任一锁定片段相交即返回
+`409 RATE_WINDOW_LOCKED`（响应 `detail.locks` 逐一列出相交的锁、锁定片段与交集），
+且不新增版本、补偿片段或血缘边；仅端点相触不算相交。合同不存在或该认知时点
+无可见版本时，整窗为 `gap`，同样返回 `409 RATE_LOCK_UNSAFE`（不报 404）。
+
+`409 RATE_WINDOW_LOCKED` 响应示例：
+
+```json
+{
+  "detail": {
+    "code": "RATE_WINDOW_LOCKED",
+    "message": "合同 HT-2026-001 的拟议区间与 1 段已锁定片段相交，禁止录入/修订",
+    "locks": [
+      {"lock_id": 1, "segment_id": 1, "rate_id": 2,
+       "locked_from": "2026-04-01T00:00:00.000000+00:00",
+       "locked_to": "2026-07-01T00:00:00.000000+00:00",
+       "intersection": {"from": "2026-05-01T00:00:00.000000+00:00",
+                        "to": "2026-07-01T00:00:00.000000+00:00"}}
+    ]
+  }
+}
+```
+
+### 9. 合同锁记录查询 — `GET /contracts/{contract_no}/rate-locks`
+
+```bash
+curl http://localhost:8000/contracts/HT-2026-001/rate-locks
+```
+
+按锁定 id 升序列出该合同全部费率锁：每条含锁头（窗口、`known_at`、`reason`、
+落库时间 `created_at`）与连续铺满锁窗口的片段（`from` / `to` / `rate_id` /
+`rate`）。无锁记录（含合同不存在）时返回 `200` 与空列表，不报 404。
+
 响应示例（v2 部分重叠取代 v1 并产生两个补偿版本 v3、v4；查询 `v2` 与 `v3`）：
 
 ```json
@@ -373,8 +447,8 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG）
-  db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边）
+  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁定）
+  db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边 + rate_locks/rate_lock_segments 结算期锁）
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py
 Dockerfile / docker-compose.yml

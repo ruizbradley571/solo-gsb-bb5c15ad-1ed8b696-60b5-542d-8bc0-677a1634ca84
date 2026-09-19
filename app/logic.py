@@ -53,6 +53,31 @@ class LineageCorruptError(ValueError):
     """血缘图损坏：存在环（不再是 DAG）或悬空边（祖先版本不存在）。"""
 
 
+class RateLockUnsafeError(RuntimeError):
+    """锁定窗口在指定认知时点下存在 gap / conflict 片段，禁止锁定（不落库）。"""
+
+    def __init__(self, contract_no: str, known_at: str, unsafe_segments: list[dict]):
+        self.contract_no = contract_no
+        self.known_at = known_at
+        self.unsafe_segments = unsafe_segments
+        super().__init__(
+            f"合同 {contract_no} 的锁定窗口在认知时点 {known_at} 下存在 "
+            f"{len(unsafe_segments)} 段 gap/conflict 片段，禁止锁定"
+        )
+
+
+class RateWindowLockedError(RuntimeError):
+    """拟议区间与既有锁定片段相交，禁止新增/修订费率。"""
+
+    def __init__(self, contract_no: str, conflicts: list[dict]):
+        self.contract_no = contract_no
+        self.conflicts = conflicts
+        super().__init__(
+            f"合同 {contract_no} 的拟议区间与 {len(conflicts)} 段已锁定片段相交，"
+            "禁止录入/修订"
+        )
+
+
 def record_rate(
     contract_no: str,
     rate: float,
@@ -74,6 +99,9 @@ def record_rate(
     补偿片段按 valid_from 排序（同点按被覆盖版本的原始顺序）在后。血缘边也在
     同一事务写入：新版本对每个被取代版本建 supersedes 边，每个补偿片段对其
     来源旧版本建 retained_from 边。
+
+    若拟议区间与该合同任一结算期锁定片段相交（仅端点相触不算相交），抛出
+    RateWindowLockedError：不新增版本、不产生补偿片段、不写血缘边。
 
     返回 (新版本行, 被取代的版本 id 列表, 补偿版本行列表)。
     """
@@ -97,6 +125,38 @@ def record_rate(
             raise NonMonotonicRecordTimeError(
                 f"recorded_at={ra} 早于合同 {contract_no} 已有记录时间 {state['max_ra']}，"
                 "系统时间必须单调递增"
+            )
+
+        # 结算期锁：拟议区间与任一锁定片段相交时整体拒绝（先于一切写入，
+        # 故不会新增版本、补偿片段或血缘边）。NULL valid_to 用 INF 占位比较。
+        locked = conn.execute(
+            "SELECT s.id AS segment_id, s.lock_id AS lock_id, s.rate_id AS rate_id, "
+            "       s.valid_from AS locked_from, s.valid_to AS locked_to "
+            "FROM rate_lock_segments s "
+            "JOIN rate_locks l ON l.id = s.lock_id "
+            "WHERE l.contract_no = ? "
+            "  AND s.valid_from < COALESCE(?, ?) "
+            "  AND s.valid_to > ? "
+            "ORDER BY s.valid_from ASC, s.id ASC",
+            (contract_no, vt, INF, vf),
+        ).fetchall()
+        if locked:
+            raise RateWindowLockedError(
+                contract_no,
+                [
+                    {
+                        "lock_id": row["lock_id"],
+                        "segment_id": row["segment_id"],
+                        "rate_id": row["rate_id"],
+                        "locked_from": row["locked_from"],
+                        "locked_to": row["locked_to"],
+                        "intersection": {
+                            "from": max(vf, row["locked_from"]),
+                            "to": min(vt or INF, row["locked_to"]),
+                        },
+                    }
+                    for row in locked
+                ],
             )
 
         overlaps = conn.execute(
@@ -326,13 +386,21 @@ def get_lineage(rate_id: int) -> dict:
 
 
 def _visible_clipped(
-    contract_no: str, f: str, t: str, ka: str
+    contract_no: str,
+    f: str,
+    t: str,
+    ka: str,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> list[tuple[str, str, sqlite3.Row]]:
     """ka 时点可见版本的业务区间裁剪到窗口 [f, t)，返回 (起点, 终点, 版本行) 列表。
 
     f / t / ka 均须为已规范化的等宽 ISO 字符串；NULL valid_to 用 INF 占位参与比较。
+    可传入已有连接以并入调用方的事务（如费率锁定）；缺省自建连接。
     """
-    with connect() as conn:
+    own_conn = conn is None
+    if own_conn:
+        conn = connect()
+    try:
         rows = conn.execute(
             "SELECT * FROM rate_versions "
             "WHERE contract_no = ? "
@@ -343,6 +411,9 @@ def _visible_clipped(
             "ORDER BY version ASC, id ASC",
             (contract_no, ka, ka, t, f),
         ).fetchall()
+    finally:
+        if own_conn:
+            conn.close()
     return [
         (max(row["valid_from"], f), min(row["valid_to"] or INF, t), row)
         for row in rows
@@ -365,18 +436,24 @@ def _coverage_status(candidates: list[sqlite3.Row]) -> str:
     return "conflict"
 
 
-def _visible_segments(contract_no: str, f: str, t: str, ka: str) -> list[dict]:
+def _visible_segments(
+    contract_no: str,
+    f: str,
+    t: str,
+    ka: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[dict]:
     """以 ka 时点可见版本的业务区间边界把窗口 [f, t) 切为连续片段。
 
     f / t / ka 均须为已规范化的等宽 ISO 字符串。先筛出 ka 可见的版本
     （recorded_at <= ka 且未被取代），将其业务区间裁剪到窗口后切分；
     每段按命中的候选版本数分类：0 → gap，1 → covered，>1 → conflict；
-    分类与候选完全相同的相邻段合并为一段。
+    分类与候选完全相同的相邻段合并为一段。可传入已有连接以并入调用方事务。
 
     返回 {"from", "to", "status", "candidates": [Row]} 字典列表，连续铺满整个窗口；
     无可见版本时自然得到覆盖整窗的单个 gap 段。
     """
-    clipped = _visible_clipped(contract_no, f, t, ka)
+    clipped = _visible_clipped(contract_no, f, t, ka, conn)
 
     # 以所有区间边界（含窗口端点）切分 [f, t)
     bounds = sorted({f, t, *(p for s, e, _ in clipped for p in (s, e))})
@@ -624,3 +701,129 @@ def compute_charge_preview(
         "total_amount": round(total, CHARGE_SCALE) if all_ok else None,
         "lines": out_lines,
     }
+
+
+# ---------- 结算期费率锁定 ----------
+
+
+def create_rate_lock(
+    contract_no: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    known_at: Optional[datetime],
+    reason: Optional[str],
+) -> dict:
+    """结算期费率锁定：把窗口 [from, to) 在 known_at 认知时点下的费率锁死。
+
+    复用覆盖率分析的切分规则（_visible_segments）把窗口切成连续片段；
+    仅当整个窗口均为 covered（每段有唯一版本依据）时，才在同一事务内写入
+    锁头与全部锁定片段（含各片段的 basis rate_id）。任一片段为 gap / conflict
+    时抛出 RateLockUnsafeError，不落任何记录。known_at 缺省为当前时间，
+    且不得晚于当前时间。
+
+    返回与 list_rate_locks 元素相同的锁记录字典。
+    """
+    f = iso(from_dt)
+    t = iso(to_dt)
+    if f >= t:
+        raise InvalidIntervalError("from 必须早于 to")
+    ka = iso(known_at) if known_at is not None else now_iso()
+    if ka > now_iso():
+        raise FutureKnownAtError(f"known_at={ka} 晚于当前时间，认知时点不能取自未来")
+
+    conn = connect()
+    try:
+        # 覆盖计算与锁记录写入在同一连接（同一事务）内完成，避免判定与落库之间
+        # 被并发修订改变可见性。
+        segments = _visible_segments(contract_no, f, t, ka, conn)
+        unsafe = [seg for seg in segments if seg["status"] != "covered"]
+        if unsafe:
+            raise RateLockUnsafeError(contract_no, ka, unsafe)
+
+        created = now_iso()
+        cursor = conn.execute(
+            "INSERT INTO rate_locks "
+            "(contract_no, valid_from, valid_to, known_at, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (contract_no, f, t, ka, reason, created),
+        )
+        lock_id = cursor.lastrowid
+        out_segments = []
+        for seg in segments:
+            basis = seg["candidates"][0]
+            seg_cursor = conn.execute(
+                "INSERT INTO rate_lock_segments (lock_id, valid_from, valid_to, rate_id) "
+                "VALUES (?, ?, ?, ?)",
+                (lock_id, seg["from"], seg["to"], basis["id"]),
+            )
+            out_segments.append(
+                {
+                    "segment_id": seg_cursor.lastrowid,
+                    "from": seg["from"],
+                    "to": seg["to"],
+                    "rate_id": basis["id"],
+                    "rate": basis["rate"],
+                }
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "lock_id": lock_id,
+        "contract_no": contract_no,
+        "from": f,
+        "to": t,
+        "known_at": ka,
+        "reason": reason,
+        "created_at": created,
+        "segments": out_segments,
+    }
+
+
+def list_rate_locks(contract_no: str) -> list[dict]:
+    """合同的全部锁记录（含连续片段及其 basis 版本），按锁定 id 升序；
+    片段按 valid_from 升序。合同无锁记录时返回空列表（不报 404）。"""
+    with connect() as conn:
+        locks = conn.execute(
+            "SELECT * FROM rate_locks WHERE contract_no = ? ORDER BY id ASC",
+            (contract_no,),
+        ).fetchall()
+        segments = conn.execute(
+            "SELECT s.id AS segment_id, s.lock_id AS lock_id, s.valid_from, s.valid_to, "
+            "       s.rate_id, r.rate "
+            "FROM rate_lock_segments s "
+            "JOIN rate_locks l ON l.id = s.lock_id "
+            "JOIN rate_versions r ON r.id = s.rate_id "
+            "WHERE l.contract_no = ? "
+            "ORDER BY s.lock_id ASC, s.valid_from ASC, s.id ASC",
+            (contract_no,),
+        ).fetchall()
+    segments_by_lock: dict[int, list[sqlite3.Row]] = {}
+    for seg in segments:
+        segments_by_lock.setdefault(seg["lock_id"], []).append(seg)
+    return [
+        {
+            "lock_id": lock["id"],
+            "contract_no": lock["contract_no"],
+            "from": lock["valid_from"],
+            "to": lock["valid_to"],
+            "known_at": lock["known_at"],
+            "reason": lock["reason"],
+            "created_at": lock["created_at"],
+            "segments": [
+                {
+                    "segment_id": seg["segment_id"],
+                    "from": seg["valid_from"],
+                    "to": seg["valid_to"],
+                    "rate_id": seg["rate_id"],
+                    "rate": seg["rate"],
+                }
+                for seg in segments_by_lock.get(lock["id"], [])
+            ],
+        }
+        for lock in locks
+    ]
