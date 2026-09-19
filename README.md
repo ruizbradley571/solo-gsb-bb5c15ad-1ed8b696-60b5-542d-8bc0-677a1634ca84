@@ -59,6 +59,17 @@ docker compose up --build
 各 1 条 `retained_from` 边。**没有任何出边的版本（含功能上线前录入的历史行）
 视为血缘根**，血缘查询对根版本返回单节点、无边。
 
+**结算期费率锁（v1.5 起）**：费率锁定把某个结算期窗口 `[from, to)` 在指定认知时点
+`known_at` 下唯一可见的费率**固定下来**。锁定复用覆盖率切分规则：以该时点可见版本
+的业务边界把窗口切为连续片段，**仅当整个窗口逐段均为 `covered`** 时，才在**单一事务**
+内按片段写入锁记录（`rate_locks`，只追加），每段记录其当时唯一依据的 `basis rate_id`；
+任一片段是 `gap` 或 `conflict`，整批拒绝（`409 RATE_LOCK_UNSAFE`）、**不落任何锁**。
+
+锁一旦存在，`POST /rates` 的拟议区间与**任一锁定片段相交**（左闭右开，仅端点相接
+不算）即被拒绝（`409 RATE_WINDOW_LOCKED`，响应列出相交的锁及各自交集），
+**不新增版本、不产生补偿片段、不写血缘边**——锁外区间的正常修订不受影响。
+锁记录不因后续修订而改变，可在审计时与当前费率对照。
+
 ## 接口
 
 ### 1. 录入 / 修订费率 — `POST /rates`
@@ -84,6 +95,10 @@ curl -X POST http://localhost:8000/rates \
   历史 `known_at` 仍可看到未被切分的原版本（见下文“双时态模型”）。
 - 同一合同 `recorded_at` 必须单调递增，否则 `422 NON_MONOTONIC_RECORDED_AT`；
   `valid_to <= valid_from` 返回 `422 INVALID_INTERVAL`。
+- 拟议区间与任一**结算期费率锁**片段相交时返回 `409 RATE_WINDOW_LOCKED`
+  （见第 8 节）：`detail.locks` 列出相交锁、`detail.intersections` 按同序列出
+  各自交集 `{from, to}`；此时**不新增版本、不产生补偿片段、不写血缘边**。
+  区间左闭右开，仅端点相接不算相交，锁外修订照常进行。
 
 部分重叠修订的响应示例（原费率 0.05 覆盖全年，新费率 0.09 只替换 4–6 月）：
 
@@ -359,6 +374,89 @@ curl http://localhost:8000/rates/2/lineage
 }
 ```
 
+### 8. 锁定结算期费率 — `POST /contracts/{contract_no}/rate-locks`
+
+```bash
+curl -X POST http://localhost:8000/contracts/HT-2026-001/rate-locks \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "from": "2026-04-01T00:00:00Z",
+        "to":   "2026-07-01T00:00:00Z",
+        "known_at": "2026-03-02T00:00:00Z",
+        "reason": "Q2 结算期锁价"
+      }'
+```
+
+- 请求体：`from`、`to`、`known_at` 必填（均 ISO-8601），`reason` 可选（≤500 字）；
+  窗口左闭右开 `[from, to)`。
+- 服务端**复用覆盖率切分规则**：以 `known_at` 时点可见版本的业务边界把锁定窗口
+  切为连续片段，逐段判定覆盖状态。
+- 仅当**整个窗口在该认知时点均为 `covered`** 时，才在**单一事务**内按连续片段
+  保存锁记录，每段记录该片段当时唯一可见版本的 `basis_rate_id`；全部片段共享
+  本次的 `known_at` / `reason`，并各自带审计用 `created_at`。
+- 任一片段是 `gap`（含合同不存在、版本在该认知时点尚不可见）或 `conflict`
+  （重叠脏数据）时，返回 `409 RATE_LOCK_UNSAFE`，响应 `segments` 与覆盖率分析
+   结构一致（`gap` 无依据、`conflict` 附全部候选），**整批回滚、不落任何锁**。
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| 整窗逐段 covered，锁已写入 | 201 | — |
+| 窗口含 gap / conflict | 409 | `RATE_LOCK_UNSAFE`（附 `segments`） |
+| `from >= to` | 422 | `INVALID_INTERVAL` |
+| 缺必填字段 / 时间格式非法 | 422 | `INVALID_REQUEST` |
+
+响应示例（窗口跨越两个可见版本：2 月是修订前费率的补偿版本 v3，4–6 月是修订后的 v2）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "from": "2026-02-01T00:00:00.000000+00:00",
+  "to":   "2026-07-01T00:00:00.000000+00:00",
+  "known_at": "2026-03-02T00:00:00.000000+00:00",
+  "locks": [
+    {"lock_id": 1, "contract_no": "HT-2026-001",
+     "from": "2026-02-01T00:00:00.000000+00:00",
+     "to":   "2026-04-01T00:00:00.000000+00:00",
+     "known_at": "2026-03-02T00:00:00.000000+00:00",
+     "basis_rate_id": 3, "reason": "Q2 结算期锁价",
+     "created_at": "2026-09-19T10:00:00.000000+00:00"},
+    {"lock_id": 2, "contract_no": "HT-2026-001",
+     "from": "2026-04-01T00:00:00.000000+00:00",
+     "to":   "2026-07-01T00:00:00.000000+00:00",
+     "known_at": "2026-03-02T00:00:00.000000+00:00",
+     "basis_rate_id": 2, "reason": "Q2 结算期锁价",
+     "created_at": "2026-09-19T10:00:00.000000+00:00"}
+  ]
+}
+```
+
+锁定后，`POST /rates` 拟议区间与任一片段相交会被拒绝，响应示例：
+
+```json
+{
+  "detail": {
+    "code": "RATE_WINDOW_LOCKED",
+    "message": "合同 'HT-2026-001' 的拟议区间 [...] 与 1 个结算期费率锁片段相交，锁定窗口内不得修订费率",
+    "locks": [ {"lock_id": 2, "basis_rate_id": 2, "...": "..."} ],
+    "intersections": [
+      {"from": "2026-05-01T00:00:00.000000+00:00",
+       "to":   "2026-06-01T00:00:00.000000+00:00"}
+    ]
+  }
+}
+```
+
+### 9. 查询合同锁记录 — `GET /contracts/{contract_no}/rate-locks`
+
+```bash
+curl http://localhost:8000/contracts/HT-2026-001/rate-locks
+```
+
+按锁定片段起点（写入顺序）列出该合同的全部锁记录（只追加、不修改、不删除），
+每条含锁定区间、`known_at`、`basis_rate_id`、`reason` 与 `created_at`；
+多次锁定产生的片段一并返回。合同有费率版本但尚无锁时返回空数组；
+合同不存在（无任何费率版本）返回 `404 CONTRACT_NOT_FOUND`。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -373,8 +471,8 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG）
-  db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边）
+  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁）
+  db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边 + rate_locks 费率锁）
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py
 Dockerfile / docker-compose.yml

@@ -34,6 +34,24 @@ CREATE TABLE IF NOT EXISTS rate_version_edges (
     FOREIGN KEY (to_rate_id) REFERENCES rate_versions (id)
 );
 CREATE INDEX IF NOT EXISTS idx_rate_version_edges_from ON rate_version_edges (from_rate_id);
+
+-- 结算期费率锁（v1.5 起）：锁定窗口 [valid_from, valid_to) 必须在 known_at 认知时点
+-- 全部 covered，按覆盖率切分得到的每个连续片段落一行，并记录该片段当时唯一可见的
+-- 费率版本（basis_rate_id）。只追加、不修改、不删除；存在 gap/conflict 时整批不落库。
+-- POST /rates 的拟议区间与任一锁定片段相交即被拒绝（RATE_WINDOW_LOCKED）。
+CREATE TABLE IF NOT EXISTS rate_locks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_no   TEXT NOT NULL,          -- 合同号
+    valid_from    TEXT NOT NULL,          -- 锁定片段起点（含），UTC ISO 字符串
+    valid_to      TEXT NOT NULL,          -- 锁定片段终点（不含），UTC ISO 字符串
+    known_at      TEXT NOT NULL,          -- 锁定所依据的认知时点
+    basis_rate_id INTEGER NOT NULL,       -- 该片段在 known_at 时点唯一可见的费率版本
+    reason        TEXT,                   -- 锁定原因
+    created_at    TEXT NOT NULL,          -- 锁记录写入时间（审计用）
+    FOREIGN KEY (basis_rate_id) REFERENCES rate_versions (id)
+);
+CREATE INDEX IF NOT EXISTS idx_rate_locks_contract
+    ON rate_locks (contract_no, valid_from, valid_to);
 """
 
 

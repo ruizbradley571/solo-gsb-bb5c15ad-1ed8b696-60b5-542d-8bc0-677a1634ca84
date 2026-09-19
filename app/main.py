@@ -24,8 +24,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.4.0",
-    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录。",
+    version="1.5.0",
+    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期费率锁保证锁定窗口内费率不再被修订。",
     lifespan=lifespan,
 )
 
@@ -198,6 +198,45 @@ class ChargePreviewResponse(BaseModel):
     lines: list[ChargeLineView]
 
 
+class RateLockCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: datetime = Field(alias="from", description="锁定结算期起点（含），ISO-8601")
+    to: datetime = Field(description="锁定结算期终点（不含），ISO-8601")
+    known_at: datetime = Field(description="锁定所依据的认知时点，ISO-8601")
+    reason: Optional[str] = Field(default=None, max_length=500, description="锁定原因")
+
+
+class RateLockView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    lock_id: int
+    contract_no: str
+    from_: str = Field(alias="from", description="锁定片段起点（含）")
+    to: str = Field(description="锁定片段终点（不含）")
+    known_at: str = Field(description="锁定所依据的认知时点")
+    basis_rate_id: int = Field(description="该片段在 known_at 时点唯一可见的费率版本 id")
+    reason: Optional[str]
+    created_at: str = Field(description="锁记录写入时间（审计用）")
+
+
+class RateLockCreated(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    contract_no: str
+    from_: str = Field(alias="from", description="锁定窗口起点（含）")
+    to: str = Field(description="锁定窗口终点（不含）")
+    known_at: str
+    locks: list[RateLockView] = Field(
+        description="按覆盖率切分得到的连续锁记录（每段附 basis rate_id），按片段起点排序"
+    )
+
+
+class RateLockListResponse(BaseModel):
+    contract_no: str
+    locks: list[RateLockView]
+
+
 def to_view(row: sqlite3.Row) -> VersionView:
     return VersionView(
         rate_id=row["id"],
@@ -210,6 +249,29 @@ def to_view(row: sqlite3.Row) -> VersionView:
         superseded_at=row["superseded_at"],
         status="current" if row["superseded_at"] is None else "superseded",
         reason=row["reason"],
+    )
+
+
+def to_lock_view(row: sqlite3.Row) -> RateLockView:
+    return RateLockView(
+        lock_id=row["id"],
+        contract_no=row["contract_no"],
+        from_=row["valid_from"],
+        to=row["valid_to"],
+        known_at=row["known_at"],
+        basis_rate_id=row["basis_rate_id"],
+        reason=row["reason"],
+        created_at=row["created_at"],
+    )
+
+
+def to_coverage_segment(seg: dict) -> CoverageSegment:
+    return CoverageSegment(
+        from_=seg["from"],
+        to=seg["to"],
+        status=seg["status"],
+        basis=to_view(seg["candidates"][0]) if seg["status"] == "covered" else None,
+        candidates=[to_view(r) for r in seg["candidates"]] if seg["status"] == "conflict" else [],
     )
 
 
@@ -252,6 +314,16 @@ def create_rate(payload: RateCreate):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "NON_MONOTONIC_RECORDED_AT", "message": str(exc)},
+        )
+    except logic.RateWindowLockedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "RATE_WINDOW_LOCKED",
+                "message": str(exc),
+                "locks": [to_lock_view(c["lock"]).model_dump(by_alias=True) for c in exc.conflicts],
+                "intersections": [c["intersection"] for c in exc.conflicts],
+            },
         )
     return RateCreated(
         created=to_view(row),
@@ -354,16 +426,7 @@ def coverage(
         from_=iso(from_),
         to=iso(to),
         known_at=ka,
-        segments=[
-            CoverageSegment(
-                from_=seg["from"],
-                to=seg["to"],
-                status=seg["status"],
-                basis=to_view(seg["candidates"][0]) if seg["status"] == "covered" else None,
-                candidates=[to_view(r) for r in seg["candidates"]] if seg["status"] == "conflict" else [],
-            )
-            for seg in segments
-        ],
+        segments=[to_coverage_segment(seg) for seg in segments],
     )
 
 
@@ -451,4 +514,63 @@ def charge_preview(contract_no: str, payload: ChargePreviewRequest):
         status="ok" if result["ok"] else "rejected",
         total_amount=result["total_amount"],
         lines=result["lines"],
+    )
+
+
+@app.post(
+    "/contracts/{contract_no}/rate-locks",
+    response_model=RateLockCreated,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_rate_lock(contract_no: str, payload: RateLockCreate):
+    """锁定结算期费率：复用覆盖率切分规则校验 [from, to) 在 known_at 时点全部 covered。
+
+    仅当整个窗口均为 covered 时，才在单一事务内按连续片段保存锁记录及各段的
+    basis rate_id；存在 gap/conflict 返回 409 RATE_LOCK_UNSAFE 且不落库。
+    """
+    try:
+        lock_rows, ka = logic.create_rate_lock(
+            contract_no,
+            payload.from_,
+            payload.to,
+            payload.known_at,
+            payload.reason,
+        )
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    except logic.RateLockUnsafeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "RATE_LOCK_UNSAFE",
+                "message": str(exc),
+                "segments": [
+                    to_coverage_segment(seg).model_dump(by_alias=True)
+                    for seg in exc.segments
+                ],
+            },
+        )
+    return RateLockCreated(
+        contract_no=contract_no,
+        from_=iso(payload.from_),
+        to=iso(payload.to),
+        known_at=ka,
+        locks=[to_lock_view(r) for r in lock_rows],
+    )
+
+
+@app.get("/contracts/{contract_no}/rate-locks", response_model=RateLockListResponse)
+def list_rate_locks(contract_no: str):
+    """合同的结算期费率锁记录：按锁定片段起点（写入顺序）列出全部锁及其 basis rate_id。"""
+    if not logic.get_timeline(contract_no):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "CONTRACT_NOT_FOUND", "message": f"合同 '{contract_no}' 无任何费率版本"},
+        )
+    return RateLockListResponse(
+        contract_no=contract_no,
+        locks=[to_lock_view(r) for r in logic.get_rate_locks(contract_no)],
     )
