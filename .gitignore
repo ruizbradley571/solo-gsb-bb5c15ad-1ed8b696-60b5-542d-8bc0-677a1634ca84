@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+rates.db
+*.db-wal
+*.db-shm
+.venv/
